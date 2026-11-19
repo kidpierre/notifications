@@ -1,0 +1,96 @@
+services:
+  kafka:
+    image: apache/kafka:4.1.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # 9092 — для наших контейнеров, 9093 — для контроллера, 29092 — для хоста
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      # какой адрес брокер называет клиентам: своим — kafka:9092, с хоста — localhost:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      # TLS нигде нет, для локалки хватает
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      # через этот листенер общается контроллер
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # брокеры между собой ходят через PLAINTEXT (у нас он один, но указать надо)
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # кворум из одного узла — из нас самих
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      # брокер один, так что служебным топикам хватит одной копии (по умолчанию 3 — группа бы не завелась)
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # ждём 3 с, пока подтянутся все consumer'ы, чтобы не делить партиции три раза подряд
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 3000
+      # топики создаёт только kafka-init, иначе получили бы 1 партицию вместо 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # тут лежат сами сообщения, папка в volume kafka-data
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - "29092:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 30s
+      start_period: 60s
+      start_interval: 2s
+      timeout: 10s
+      retries: 20
+    restart: unless-stopped
+
+  kafka-init:
+    image: apache/kafka:4.1.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic ${KAFKA_TOPIC:-user-notifications} --partitions 3 --replication-factor 1 &&
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic ${KAFKA_DLQ_TOPIC:-user-notifications.dlq} --partitions 1 --replication-factor 1
+    restart: "no"
+
+  producer:
+    build:
+      context: .
+      args:
+        SERVICE: producer
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      HTTP_PORT: 8080
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-user-notifications}
+      KAFKA_WRITE_TIMEOUT: ${KAFKA_WRITE_TIMEOUT:-5s}
+      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-10s}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
+    restart: unless-stopped
+    stop_grace_period: ${STOP_GRACE_PERIOD:-20s}
+
+  consumer:
+    build:
+      context: .
+      args:
+        SERVICE: consumer
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-user-notifications}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-user-notifications.dlq}
+      KAFKA_GROUP_ID: ${KAFKA_GROUP_ID:-notification-processor}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    deploy:
+      replicas: ${CONSUMER_REPLICAS:-3}
+    restart: unless-stopped
+    stop_grace_period: ${STOP_GRACE_PERIOD:-20s}
+
+volumes:
+  kafka-data:
